@@ -164,6 +164,12 @@ class ZarrSink(Sink["xr.DataArray"]):
         overwritten during pre-allocation.  If *False* (default), existing
         variable groups are preserved and only missing variables are
         created, allowing pipelines to resume from partial runs.
+    track_valid : bool
+        If *True* and the store is pre-allocated, create a 1-D ``valid``
+        boolean array of length *n_indices*, chunked per time step
+        (``chunks=(1,)``).  Each successful region write sets
+        ``valid[index] = True``.  Call :meth:`finalize` once writing is
+        complete to rechunk ``valid`` into a single chunk for faster reads.
     storage_options : dict[str, Any] | None
         Extra keyword arguments for the fsspec filesystem.  Use this
         to provide credentials for remote stores (e.g., S3 keys).
@@ -211,6 +217,7 @@ class ZarrSink(Sink["xr.DataArray"]):
 
     name: ClassVar[str] = "Zarr Writer"
     description: ClassVar[str] = "Write DataArrays to a Zarr store with configurable chunking and sharding"
+    _VALID_NAME: ClassVar[str] = "valid"
 
     _DEFAULT_CHUNKS: ClassVar[dict[str, int]] = {"time": 1, "lat": 721, "lon": 1440}
 
@@ -248,6 +255,7 @@ class ZarrSink(Sink["xr.DataArray"]):
         n_indices: int | None = None,
         variables: list[str] | None = None,
         overwrite: bool = False,
+        track_valid: bool = False,
         storage_options: dict[str, Any] | None = None,
     ) -> None:
         self._log = get_logger(self)
@@ -259,6 +267,7 @@ class ZarrSink(Sink["xr.DataArray"]):
         self._n_indices = n_indices
         self._variables = variables
         self._overwrite = overwrite
+        self._track_valid = track_valid
         self._preallocated = False
 
         # Lazy-initialized in workers (can't pickle stores with async resources)
@@ -421,6 +430,9 @@ class ZarrSink(Sink["xr.DataArray"]):
 
             self._log.debug("Pre-allocated Zarr array: %s/%s (metadata only)", self._output_path, var_name)
 
+        if self._track_valid:
+            self._ensure_valid_array(root, n_indices)
+
         self._preallocated = True
         if vars_to_create:
             self._log.info(
@@ -432,6 +444,89 @@ class ZarrSink(Sink["xr.DataArray"]):
 
         # Reset store so workers create their own (FsspecStore can't be pickled)
         self._store = None
+
+    def _ensure_valid_array(self, root: zarr.Group, n_indices: int) -> None:
+        """Create the per-time-step ``valid`` flag array if missing.
+
+        Chunked as ``(1,)`` so concurrent workers can safely set individual
+        indices without contending for the same chunk.  Call :meth:`finalize`
+        after writing completes to rechunk into a single contiguous array.
+        """
+        name = self._VALID_NAME
+        if name in root and not self._overwrite:
+            existing = root[name]
+            if isinstance(existing, zarr.Array) and existing.shape == (n_indices,):
+                self._log.debug("Reusing existing '%s' array at: %s", name, self._output_path)
+                return
+            self._log.warning("Replacing incompatible '%s' array at: %s", name, self._output_path)
+            del root[name]
+        elif name in root and self._overwrite:
+            del root[name]
+
+        root.create_array(
+            name,
+            shape=(n_indices,),
+            chunks=(1,),
+            dtype=np.bool_,
+            fill_value=False,
+            dimension_names=[self._append_dim],
+            write_data=False,
+        )
+        self._log.info(
+            "Pre-allocated '%s' array: shape=(%d,), chunks=(1,)",
+            name,
+            n_indices,
+        )
+
+    def _mark_valid(self, index: int) -> None:
+        """Mark *index* as successfully written in the ``valid`` array."""
+        if not self._track_valid or not self._preallocated:
+            return
+        if self._root_group is None:
+            self._root_group = zarr.open_group(self._get_store(), mode="r+")
+        arr = self._root_group[self._VALID_NAME]
+        assert isinstance(arr, zarr.Array), f"Expected Array, got {type(arr)}"
+        arr[index] = True
+
+    def finalize(self) -> None:
+        """Rechunk the ``valid`` array into a single chunk for fast reads.
+
+        Must be called only when no workers are writing.  No-op when
+        *track_valid* is ``False`` or the store was not pre-allocated.
+        """
+        if not self._track_valid or not self._preallocated:
+            return
+
+        # Force a fresh root group handle (may have been reset after pickling).
+        self._root_group = None
+        root = zarr.open_group(self._get_store(), mode="r+")
+        name = self._VALID_NAME
+        if name not in root:
+            self._log.warning("finalize(): '%s' array missing at %s", name, self._output_path)
+            return
+
+        old = root[name]
+        assert isinstance(old, zarr.Array), f"Expected Array, got {type(old)}"
+        n_indices = int(old.shape[0])
+        data = np.asarray(old[:], dtype=np.bool_)
+        del root[name]
+        root.create_array(
+            name,
+            shape=(n_indices,),
+            chunks=(n_indices,),
+            dtype=np.bool_,
+            fill_value=False,
+            dimension_names=[self._append_dim],
+            write_data=True,
+        )
+        root[name][:] = data
+        self._root_group = root
+        self._log.info(
+            "Finalized '%s' array: shape=(%d,), chunks=(%d,)",
+            name,
+            n_indices,
+            n_indices,
+        )
 
     def __call__(self, items: Iterator[xr.DataArray], index: int) -> list[str]:
         """Consume DataArrays and write each variable to the Zarr store.
@@ -543,6 +638,7 @@ class ZarrSink(Sink["xr.DataArray"]):
         if self._preallocated:
             # Concurrent async writes for all variables at this index
             self._async_region_write_all(da, variables, index)
+            self._mark_valid(index)
             for var_name in variables:
                 paths.append(f"{self._output_path}/{var_name!s}")
         else:
@@ -616,6 +712,7 @@ class ZarrSink(Sink["xr.DataArray"]):
 
         # Write to the specific index along the append dimension (first dim)
         arr[index] = data
+        self._mark_valid(index)
 
     def _async_region_write_all(self, da: xr.DataArray, variables: np.ndarray, index: int) -> None:
         """Write all variables for a single index concurrently via async I/O.

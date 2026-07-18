@@ -974,10 +974,112 @@ class TestZarrSink:
         sink = ZarrSink(output_path=str(tmp_path / "output.zarr"))
         assert sink.output_path == str(tmp_path / "output.zarr")
 
+    def test_track_valid_prealloc_and_mark(self, tmp_path: Path) -> None:
+        """Preallocation with track_valid creates a 1-D per-step-chunked valid array."""
+        import numpy as np
+        import zarr
 
-# ===================================================================
-# NetCDF4Sink tests
-# ===================================================================
+        from physicsnemo_curator.domains.da.sinks.zarr_writer import ZarrSink
+
+        store_path = str(tmp_path / "output.zarr")
+        sink = ZarrSink(
+            output_path=store_path,
+            chunks={"time": 1, "lat": _LATS_N, "lon": _LONS_N},
+            n_indices=4,
+            variables=["t2m"],
+            track_valid=True,
+            overwrite=True,
+        )
+        root = zarr.open_group(store_path, mode="r")
+        assert "valid" in root
+        valid = root["valid"]
+        assert valid.shape == (4,)
+        assert valid.chunks == (1,)
+        assert valid.dtype == np.dtype("bool")
+        assert not bool(valid[0])
+
+        da = _make_dataarray(variables=["t2m"], n_lat=_LATS_N, n_lon=_LONS_N)
+
+        def gen():  # type: ignore[override]
+            yield da
+
+        sink(gen(), index=2)
+
+        root = zarr.open_group(store_path, mode="r")
+        assert bool(root["valid"][2])
+        assert not bool(root["valid"][0])
+        assert not bool(root["valid"][1])
+        assert not bool(root["valid"][3])
+
+    def test_track_valid_finalize_unchunks(self, tmp_path: Path) -> None:
+        """finalize() rechunks valid into a single chunk."""
+        import numpy as np
+        import zarr
+
+        from physicsnemo_curator.domains.da.sinks.zarr_writer import ZarrSink
+
+        store_path = str(tmp_path / "output.zarr")
+        sink = ZarrSink(
+            output_path=store_path,
+            chunks={"time": 1, "lat": _LATS_N, "lon": _LONS_N},
+            n_indices=3,
+            variables=["t2m"],
+            track_valid=True,
+            overwrite=True,
+        )
+        da = _make_dataarray(variables=["t2m"], n_lat=_LATS_N, n_lon=_LONS_N)
+
+        def gen0():  # type: ignore[override]
+            yield da
+
+        def gen1():  # type: ignore[override]
+            yield da
+
+        sink(gen0(), index=0)
+        sink(gen1(), index=1)
+
+        sink.finalize()
+
+        root = zarr.open_group(store_path, mode="r")
+        valid = root["valid"]
+        assert valid.chunks == (3,)
+        assert list(np.asarray(valid[:])) == [True, True, False]
+
+    def test_track_valid_resume_preserves_existing(self, tmp_path: Path) -> None:
+        """Resuming with overwrite=False preserves existing valid flags."""
+        import zarr
+
+        from physicsnemo_curator.domains.da.sinks.zarr_writer import ZarrSink
+
+        store_path = str(tmp_path / "output.zarr")
+        sink1 = ZarrSink(
+            output_path=store_path,
+            chunks={"time": 1, "lat": _LATS_N, "lon": _LONS_N},
+            n_indices=3,
+            variables=["t2m"],
+            track_valid=True,
+            overwrite=True,
+        )
+        da = _make_dataarray(variables=["t2m"], n_lat=_LATS_N, n_lon=_LONS_N)
+
+        def gen():  # type: ignore[override]
+            yield da
+
+        sink1(gen(), index=1)
+
+        # Second construction resumes without overwrite.
+        ZarrSink(
+            output_path=store_path,
+            chunks={"time": 1, "lat": _LATS_N, "lon": _LONS_N},
+            n_indices=3,
+            variables=["t2m"],
+            track_valid=True,
+            overwrite=False,
+        )
+        root = zarr.open_group(store_path, mode="r")
+        assert bool(root["valid"][1])
+        assert not bool(root["valid"][0])
+        assert root["valid"].chunks == (1,)
 
 
 class TestNetCDF4Sink:

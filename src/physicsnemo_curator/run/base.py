@@ -23,9 +23,10 @@ must implement, along with common utilities.
 from __future__ import annotations
 
 import os
+import pickle
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, NoReturn
 
 if TYPE_CHECKING:
     from physicsnemo_curator.core.base import Pipeline
@@ -260,6 +261,22 @@ def _ensure_worker_logging(pipeline: Pipeline[Any]) -> DatabaseLogHandler | None
         return None
 
 
+def _reraise_pickle_safe(exc: BaseException) -> NoReturn:
+    """Re-raise *exc*, converting to a pickle-safe exception when needed.
+
+    Multiprocessing backends pickle exceptions when returning results from
+    worker processes.  Some third-party errors (e.g. :class:`aiohttp.
+    ClientResponseError`) embed non-picklable header objects and would
+    otherwise terminate the worker and break the process pool.
+    """
+    try:
+        pickle.dumps(exc)
+    except Exception:
+        message = str(exc) or repr(exc)
+        raise RuntimeError(f"{type(exc).__name__}: {message}") from exc
+    raise exc
+
+
 def process_single_index(pipeline: Pipeline[Any], index: int) -> list[str]:
     """Process a single pipeline index.
 
@@ -285,7 +302,10 @@ def process_single_index(pipeline: Pipeline[Any], index: int) -> list[str]:
         handler.set_current_index(index)
 
     try:
-        result = pipeline[index]
+        try:
+            result = pipeline[index]
+        except Exception as exc:
+            _reraise_pickle_safe(exc)
         _flush_filters(pipeline, index)
         return result
     finally:
@@ -493,7 +513,10 @@ def process_index_group(pipeline: Pipeline[Any], indices: list[int]) -> dict[int
         for idx in indices:
             if handler is not None:
                 handler.set_current_index(idx)
-            results[idx] = pipeline[idx]
+            try:
+                results[idx] = pipeline[idx]
+            except Exception as exc:
+                _reraise_pickle_safe(exc)
             _flush_filters(pipeline, idx)
     finally:
         # Flush logs after processing the group

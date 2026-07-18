@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import pytest
 
 from physicsnemo_curator.run import RunConfig, list_backends, register_backend
-from physicsnemo_curator.run.base import RunBackend
+from physicsnemo_curator.run.base import RunBackend, _reraise_pickle_safe
 
 if TYPE_CHECKING:
     from physicsnemo_curator.core.base import Pipeline
@@ -187,3 +187,29 @@ class TestImports:
         assert ProcessPoolBackend.name == "process_pool"
         assert LokyBackend.name == "loky"
         assert DaskBackend.name == "dask"
+
+
+class TestPickleSafeExceptions:
+    """Tests for multiprocessing-safe exception propagation."""
+
+    def test_picklable_exception_reraised_unchanged(self):
+        """Pickleable exceptions should be re-raised as-is."""
+        with pytest.raises(ValueError, match="boom"):
+            try:
+                raise ValueError("boom")
+            except Exception as exc:
+                _reraise_pickle_safe(exc)
+
+    def test_unpicklable_exception_wrapped(self):
+        """Non-pickleable exceptions should be wrapped in RuntimeError."""
+
+        class _UnpickleableError(Exception):
+            def __reduce__(self) -> tuple[type, tuple]:
+                msg = "cannot pickle"
+                raise TypeError(msg)
+
+        with pytest.raises(RuntimeError, match="UnpickleableError: fetch failed"):
+            try:
+                raise _UnpickleableError("fetch failed")
+            except Exception as exc:
+                _reraise_pickle_safe(exc)

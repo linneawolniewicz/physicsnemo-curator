@@ -65,6 +65,37 @@ class NumberSource(Source[int]):
         yield index
 
 
+class UnpickleableFailureSource(Source[int]):
+    """Source that raises a non-pickleable exception for one index."""
+
+    name: ClassVar[str] = "UnpickleableFailure"
+    description: ClassVar[str] = "Fails with unpickleable error"
+
+    @classmethod
+    def params(cls) -> list[Param]:
+        """Return parameter definitions."""
+        return [Param(name="count", description="How many items", type=int)]
+
+    def __init__(self, count: int, fail_index: int = 1) -> None:
+        self._count = count
+        self._fail_index = fail_index
+
+    def __len__(self) -> int:
+        return self._count
+
+    def __getitem__(self, index: int) -> Generator[int]:
+        if index == self._fail_index:
+
+            class _UnpickleableError(Exception):
+                def __reduce__(self) -> tuple[type, tuple]:
+                    msg = "cannot pickle"
+                    raise TypeError(msg)
+
+            raise _UnpickleableError("bad gateway")
+
+        yield index
+
+
 class TripleFilter(Filter[int]):
     """Filter that triples each value."""
 
@@ -229,6 +260,16 @@ class TestProcessPoolBackend:
         assert len(results) == 4
         # But parent sink should NOT have been called (children have copies)
         assert sink.call_count == 0
+
+    def test_unpickleable_exception_does_not_break_pool(self):
+        """A non-pickleable worker exception should not break the process pool."""
+        pipeline = UnpickleableFailureSource(3, fail_index=1).write(ListSink())
+        pipeline.track_metrics = False
+        results = run_pipeline(pipeline, n_jobs=2, backend="process_pool", use_tui=False)
+        assert len(results) == 3
+        assert results[0] == ["item_0_0"]
+        assert results[1] == []
+        assert results[2] == ["item_2_2"]
 
 
 # ---------------------------------------------------------------------------

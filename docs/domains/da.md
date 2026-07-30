@@ -47,6 +47,38 @@ ERA5's native 0.25° resolution (721 lat × 1440 lon).
 
 **Time range**: 1940-01-01 through ~2023-11-11, hourly resolution.
 
+### OPERASource
+
+Fetches [EUMETNET OPERA](https://eumetnet.github.io/openradardata-documentation/)
+pan-European radar composites from the CloudFerro S3 archive via
+{class}`earth2studio.data.OPERA`.  Each pipeline index maps to a single
+timestamp.
+
+```python
+from datetime import datetime
+from physicsnemo_curator.domains.da.sources.opera import OPERASource
+
+source = OPERASource(
+    times=[datetime(2024, 9, 1, 0, 0), datetime(2024, 9, 1, 0, 5)],
+    variables=["refc"],
+)
+```
+
+Each ``source[i]`` yields a {class}`xarray.DataArray` with dimensions
+``(time, variable, y, x)`` on OPERA's native Lambert Equal-Area grid, with
+2-D geographic coordinates ``_lat`` / ``_lon``.
+
+| Variable | Description |
+|----------|-------------|
+| ``refc`` | Maximum reflectivity (dBZ) |
+| ``tprate`` | Instantaneous rain rate |
+| ``tp01`` | 1-hour accumulated precipitation |
+
+**Time range**: composites are published every 15 minutes before
+2024-07-01 and every 5 minutes from 2024-07-01 onward; requested
+timestamps must align to the interval for their era.  Variables with
+differing pixel resolutions cannot be mixed in a single source.
+
 ### DataArrayStatsFilter
 
 Computes running statistical moments (mean, variance, skewness, min, max)
@@ -139,6 +171,6 @@ The `da` domain depends on:
 | Package | Purpose |
 |---------|---------|
 | [xarray](https://docs.xarray.dev/) | Labelled multi-dimensional arrays |
-| [earth2studio](https://nvidia.github.io/earth2studio/) | Weather/climate data backends (ERA5, HRRR, GFS) |
+| [earth2studio](https://nvidia.github.io/earth2studio/) | Weather/climate data backends (ERA5, HRRR, GFS, OPERA) |
 | [zarr](https://zarr.readthedocs.io/) | Zarr v3 store I/O |
 | [gcsfs](https://gcsfs.readthedocs.io/) | Google Cloud Storage filesystem for ARCO data |

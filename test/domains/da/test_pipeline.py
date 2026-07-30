@@ -32,6 +32,10 @@ import pytest
 if TYPE_CHECKING:
     from pathlib import Path
 
+    import zarr
+
+    from physicsnemo_curator.domains.da.sinks.zarr_writer import ZarrSink
+
 pytestmark = pytest.mark.requires("da")
 
 # ---------------------------------------------------------------------------
@@ -866,6 +870,41 @@ class TestHRRRSource:
 # ===================================================================
 
 
+def _valid_sink(
+    tmp_path: Path, *, n_indices: int = 3, variables: list[str] | None = None, **kwargs: object
+) -> ZarrSink:
+    """Build a pre-allocated ZarrSink with valid-index tracking enabled."""
+    from physicsnemo_curator.domains.da.sinks.zarr_writer import ZarrSink
+
+    return ZarrSink(
+        output_path=str(tmp_path / "output.zarr"),
+        chunks={"time": 1, "lat": _LATS_N, "lon": _LONS_N},
+        n_indices=n_indices,
+        variables=variables if variables is not None else ["t2m"],
+        track_valid=True,
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def _write_index(sink: ZarrSink, index: int, variables: list[str] | None = None) -> list[str]:
+    """Write one synthetic DataArray to *sink* at *index*."""
+    da = _make_dataarray(variables=variables if variables is not None else ["t2m"], n_lat=_LATS_N, n_lon=_LONS_N)
+
+    def gen():  # type: ignore[override]
+        yield da
+
+    return sink(gen(), index=index)
+
+
+def _valid_array(tmp_path: Path) -> zarr.Array:
+    """Reopen the store and return its ``valid`` array."""
+    import zarr
+
+    arr = zarr.open_group(str(tmp_path / "output.zarr"), mode="r")["valid"]
+    assert isinstance(arr, zarr.Array)
+    return arr
+
+
 class TestZarrSink:
     """Unit tests for ZarrSink."""
 
@@ -973,6 +1012,84 @@ class TestZarrSink:
 
         sink = ZarrSink(output_path=str(tmp_path / "output.zarr"))
         assert sink.output_path == str(tmp_path / "output.zarr")
+
+    def test_track_valid_lifecycle(self, tmp_path: Path) -> None:
+        """The valid array is per-index chunked while writing and collapsed by finalize()."""
+        import numpy as np
+
+        sink = _valid_sink(tmp_path, overwrite=True)
+
+        valid = _valid_array(tmp_path)
+        assert valid.shape == (3,)
+        assert valid.chunks == (1,)
+        assert valid.dtype == np.dtype("bool")
+        assert not bool(valid[0])
+
+        _write_index(sink, 0)
+        _write_index(sink, 2)
+        assert list(np.asarray(_valid_array(tmp_path)[:])) == [True, False, True]
+
+        sink.finalize()
+        valid = _valid_array(tmp_path)
+        assert valid.chunks == (3,)
+        assert list(np.asarray(valid[:])) == [True, False, True]
+
+    def test_track_valid_partial_write_not_marked(self, tmp_path: Path) -> None:
+        """An index missing some pre-allocated variables must not be marked valid."""
+        sink = _valid_sink(tmp_path, n_indices=2, variables=["t2m", "q2m"], overwrite=True)
+
+        # Only one of the two pre-allocated variables arrives.
+        _write_index(sink, 0, variables=["t2m"])
+        assert not bool(_valid_array(tmp_path)[0])
+
+        _write_index(sink, 1, variables=["t2m", "q2m"])
+        assert bool(_valid_array(tmp_path)[1])
+
+    def test_track_valid_resume_preserves_existing(self, tmp_path: Path) -> None:
+        """Resuming with overwrite=False preserves existing valid flags."""
+        _write_index(_valid_sink(tmp_path, overwrite=True), 1)
+
+        _valid_sink(tmp_path, overwrite=False)
+
+        valid = _valid_array(tmp_path)
+        assert bool(valid[1])
+        assert not bool(valid[0])
+        assert valid.chunks == (1,)
+
+    def test_track_valid_resume_after_finalize_rechunks(self, tmp_path: Path) -> None:
+        """Resuming a finalized store restores per-index chunking but keeps flags."""
+        import numpy as np
+
+        sink = _valid_sink(tmp_path, overwrite=True)
+        _write_index(sink, 1)
+        sink.finalize()
+        assert _valid_array(tmp_path).chunks == (3,)
+
+        # Resuming must not leave the array single-chunked, or concurrent
+        # workers would race on the same chunk when marking their index.
+        _valid_sink(tmp_path, overwrite=False)
+
+        valid = _valid_array(tmp_path)
+        assert valid.chunks == (1,)
+        assert list(np.asarray(valid[:])) == [False, True, False]
+
+    def test_track_valid_rejects_invalid_configuration(self, tmp_path: Path) -> None:
+        """A reserved variable name or a changed n_indices is refused up front."""
+        with pytest.raises(ValueError, match="reserved"):
+            _valid_sink(tmp_path, variables=["valid", "t2m"])
+
+        _valid_sink(tmp_path, n_indices=2, overwrite=True)
+        with pytest.raises(ValueError, match="n_indices cannot change"):
+            _valid_sink(tmp_path, n_indices=4)
+
+    def test_track_valid_rejects_write_after_finalize(self, tmp_path: Path) -> None:
+        """Marking after finalize() would be an unsafe whole-array rewrite."""
+        sink = _valid_sink(tmp_path, overwrite=True)
+        _write_index(sink, 0)
+        sink.finalize()
+
+        with pytest.raises(RuntimeError, match="finalize"):
+            _write_index(sink, 1)
 
 
 # ===================================================================

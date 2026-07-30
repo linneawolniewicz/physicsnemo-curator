@@ -120,6 +120,29 @@ sink = ZarrSink(
 **Sharding** (Zarr v3) groups multiple chunks into larger shard files,
 reducing the number of objects in cloud storage.
 
+**Tracking which indices were written.** Pre-allocated stores are sized
+up front, so an unwritten slot is indistinguishable from one legitimately
+containing fill values.  Pass ``track_valid=True`` to record a per-index
+boolean ``valid`` array, flipped only once *every* pre-allocated variable
+has been written at that index:
+
+```python
+sink = ZarrSink(
+    output_path="output.zarr",
+    n_indices=72,
+    variables=["refc"],
+    track_valid=True,
+)
+# ... run the pipeline ...
+sink.finalize()  # only once no workers are writing
+```
+
+The array is chunked ``(1,)`` while writing so concurrent workers never
+contend for the same chunk.  ``finalize()`` rechunks it into a single
+chunk for fast reads and must be called after all workers have finished.
+This is useful for resuming a partial ingest, or for skipping gaps when a
+remote archive is missing timestamps.
+
 ### NetCDF4Sink
 
 Writes incoming DataArrays to NetCDF4 files.  Each variable gets its own

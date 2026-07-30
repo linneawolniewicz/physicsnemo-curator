@@ -765,9 +765,9 @@ def _merge_moment_datasets(datasets: list[xr.Dataset]) -> xr.Dataset:
         ref_var = next(iter(ds.data_vars.values()))
         shape = ref_var.shape
 
-        # Extract min/max with fallback to NaN (never-observed pixels)
-        min_val = ds["min"].values.astype(np.float64) if "min" in ds else np.full(shape, np.nan, dtype=np.float64)
-        max_val = ds["max"].values.astype(np.float64) if "max" in ds else np.full(shape, np.nan, dtype=np.float64)
+        # Extract min/max with fallback to inf/-inf
+        min_val = ds["min"].values.astype(np.float64) if "min" in ds else np.full(shape, np.inf, dtype=np.float64)
+        max_val = ds["max"].values.astype(np.float64) if "max" in ds else np.full(shape, -np.inf, dtype=np.float64)
 
         # Prefer exact Welford state if all three variables available
         if "welford_mean" in ds and "welford_m2" in ds and "welford_m3" in ds:

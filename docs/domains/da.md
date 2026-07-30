@@ -100,6 +100,16 @@ Each variable gets its own group with arrays: ``mean``, ``variance``,
 multiple workers write to the same path, results are merged using
 Chan's parallel Welford algorithm.
 
+Non-finite values (NaN/±Inf) are skipped **per element**, so gridpoints
+that are missing in some samples — for example pixels outside a radar
+domain — do not poison the statistics of their neighbors.  The
+per-element tally of finite observations is stored alongside the
+accumulator state as ``welford_n``, which is what makes the parallel
+merge exact when a gridpoint is observed by some workers but not others.
+Gridpoints with no finite observations at all report NaN for ``mean``,
+``variance``, ``skewness``, ``min``, and ``max``.  The scalar ``count``
+attribute still counts every sample seen, including all-NaN ones.
+
 ### ZarrSink
 
 Writes incoming DataArrays to a Zarr v3 store.  Each variable is written to
